@@ -1,16 +1,11 @@
 import os, re, json, time, asyncio, subprocess, requests, threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from datetime import timedelta
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, CallbackQueryHandler, filters
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes, MessageHandler, filters
 import edge_tts, yt_dlp
 
 TELEGRAM_BOT_TOKEN = "7752878545:AAFMBSnhvLEHh7Z9jdHkGoZyDTsaG-gbZj8"
 GEMINI_API_KEY = "AQ.Ab8RN6J3SI7Hcw4jHJQU4-b4IvkYYprAGPp6Wcn0PVvYvkk2BQ"
-
-CANCELLED_TASKS = set()
-TELEGRAM_MAX_UPLOAD_BYTES = 47 * 1024 * 1024
-TELEGRAM_TARGET_BYTES = 45 * 1024 * 1024
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -45,31 +40,58 @@ def build_ui(step_idx, pct, error=None):
         lines.append(f"\n⚠️ <i>{error}</i>")
     return "\n".join(lines)
 
-def get_stop_markup(chat_id):
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Stop", callback_data=f"stop_{chat_id}")]])
-
 def clean_non_burmese(text):
     text = re.sub(r'[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff]+', '', str(text))
     return re.sub(r'\s+', ' ', text).strip()
 
-def download_video(url, output_path):
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-    real_url = url
-    try:
-        res = requests.get(url, headers=headers, allow_redirects=True, timeout=10)
-        real_url = res.url
-    except Exception:
-        pass
+def download_douyin_video(url, output_path):
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1'
+    }
+    r = requests.get(url, headers=headers, allow_redirects=True, timeout=15)
+    real_url = r.url
+    item_ids = re.findall(r'/video/(\d+)', real_url) or re.findall(r'item_ids=(\d+)', real_url)
+    
+    if item_ids:
+        item_id = item_ids[0]
+        api_url = f"https://www.iesdouyin.com/web/api/v2/aweme/iteminfo/?item_ids={item_id}"
+        api_res = requests.get(api_url, headers=headers, timeout=15).json()
+        item_list = api_res.get("item_list", [])
+        if item_list:
+            play_addr = item_list[0]["video"]["play_addr"]["url_list"][0]
+            download_addr = play_addr.replace("playwm", "play")
+            v_res = requests.get(download_addr, headers=headers, stream=True, timeout=30)
+            if v_res.status_code == 200:
+                with open(output_path, 'wb') as f:
+                    for chunk in v_res.iter_content(chunk_size=1024*1024):
+                        if chunk: f.write(chunk)
+                if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
+                    return output_path
 
+    # Fallback to yt-dlp with mobile headers
+    ydl_opts = {
+        'format': 'best',
+        'outtmpl': output_path,
+        'quiet': True,
+        'no_warnings': True,
+        'user_agent': headers['User-Agent']
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl.download([url])
+    return output_path if os.path.exists(output_path) else None
+
+def download_generic_video(url, output_path):
+    if "douyin.com" in url:
+        return download_douyin_video(url, output_path)
     ydl_opts = {
         'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
         'outtmpl': output_path,
         'quiet': True,
         'no_warnings': True,
-        'http_headers': headers
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([real_url])
+        ydl.download([url])
     return output_path if os.path.exists(output_path) else None
 
 def get_video_duration(video_path):
@@ -122,7 +144,7 @@ async def build_burmese_track(subs, total_dur, prefix):
             filter_complex.append(f"[{valid}]adelay={delay_ms}|{delay_ms}[a{valid}];")
             valid += 1
     if valid == 0:
-        return None
+        raise Exception("ဘာသာပြန်အသံ ဖန်တီး၍မရပါ")
     mix_src = "".join([f"[a{k}]" for k in range(valid)])
     filter_complex.append(f"{mix_src}amix=inputs={valid}:dropout_transition=0:normalize=0[out]")
     out_audio = f"{prefix}_burmese.mp3"
@@ -138,34 +160,30 @@ def merge_audio_video(video, burmese_audio, output):
     subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return os.path.exists(output)
 
-async def process_video_pipeline(update: Update, context: ContextTypes.DEFAULT_TYPE, video_source, is_file=False):
+async def process_video_pipeline(update: Update, context: ContextTypes.DEFAULT_TYPE, video_url):
     chat_id = update.effective_chat.id
-    CANCELLED_TASKS.discard(chat_id)
-    msg = await update.message.reply_text(build_ui(0, 10), parse_mode="HTML", reply_markup=get_stop_markup(chat_id))
+    msg = await update.message.reply_text(build_ui(0, 10), parse_mode="HTML")
     prefix = f"job_{chat_id}_{int(time.time())}"
     raw_video = f"{prefix}_raw.mp4"
     audio_file = f"{prefix}_raw.mp3"
     final_video = f"{prefix}_final.mp4"
 
     try:
-        if not is_file:
-            download_video(video_source, raw_video)
-        else:
-            tf = await context.bot.get_file(video_source)
-            await tf.download_to_drive(raw_video)
+        if not download_generic_video(video_url, raw_video):
+            raise Exception("ဗီဒီယို ဒေါင်းလုဒ်မရရှိပါ (Link စစ်ဆေးပါ)")
             
         dur = get_video_duration(raw_video)
-        await msg.edit_text(build_ui(1, 30), parse_mode="HTML", reply_markup=get_stop_markup(chat_id))
+        await msg.edit_text(build_ui(1, 30), parse_mode="HTML")
         
         extract_audio(raw_video, audio_file)
-        await msg.edit_text(build_ui(2, 50), parse_mode="HTML", reply_markup=get_stop_markup(chat_id))
+        await msg.edit_text(build_ui(2, 50), parse_mode="HTML")
         
         uri = upload_to_gemini(audio_file)
         subs = analyze_and_translate(uri)
-        await msg.edit_text(build_ui(3, 70), parse_mode="HTML", reply_markup=get_stop_markup(chat_id))
+        await msg.edit_text(build_ui(3, 70), parse_mode="HTML")
         
         bm_audio = await build_burmese_track(subs, dur, prefix)
-        await msg.edit_text(build_ui(4, 90), parse_mode="HTML", reply_markup=get_stop_markup(chat_id))
+        await msg.edit_text(build_ui(4, 90), parse_mode="HTML")
         
         merge_audio_video(raw_video, bm_audio, final_video)
         
@@ -181,25 +199,19 @@ async def process_video_pipeline(update: Update, context: ContextTypes.DEFAULT_T
                 except: pass
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("မင်္ဂလာပါ! Video Link သို့မဟုတ် File ပို့ပေးပါ။")
+    await update.message.reply_text("မင်္ဂလာပါ! Douyin / TikTok / YouTube Link ပို့ပေးပါ။")
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     links = re.findall(r'https?://[^\s]+', update.message.text)
     if links:
-        await process_video_pipeline(update, context, links[0], is_file=False)
-
-async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    v = update.message.video or update.message.document
-    if v:
-        await process_video_pipeline(update, context, v.file_id, is_file=True)
+        await process_video_pipeline(update, context, links[0])
 
 def main():
     threading.Thread(target=start_health_server, daemon=True).start()
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    app.add_handler(MessageHandler(filters.VIDEO | filters.Document.VIDEO, handle_video))
-    print("Full Dubbing Bot စတင် အလုပ်လုပ်နေပါပြီ...")
+    print("Bot is ready...")
     app.run_polling()
 
 if __name__ == "__main__":
