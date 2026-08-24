@@ -44,33 +44,30 @@ def clean_non_burmese(text):
     text = re.sub(r'[\u4e00-\u9fff\u3400-\u4dbf\uf900-\ufaff]+', '', str(text))
     return re.sub(r'\s+', ' ', text).strip()
 
-def download_douyin_video(url, output_path):
+def download_video_all(url, output_path):
     headers = {
         'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.6 Mobile/15E148 Safari/604.1'
     }
-    r = requests.get(url, headers=headers, allow_redirects=True, timeout=15)
-    real_url = r.url
-    item_ids = re.findall(r'/video/(\d+)', real_url) or re.findall(r'item_ids=(\d+)', real_url)
     
-    if item_ids:
-        item_id = item_ids[0]
-        api_url = f"https://www.iesdouyin.com/web/api/v2/aweme/iteminfo/?item_ids={item_id}"
-        api_res = requests.get(api_url, headers=headers, timeout=15).json()
-        item_list = api_res.get("item_list", [])
-        if item_list:
-            play_addr = item_list[0]["video"]["play_addr"]["url_list"][0]
-            download_addr = play_addr.replace("playwm", "play")
-            v_res = requests.get(download_addr, headers=headers, stream=True, timeout=30)
-            if v_res.status_code == 200:
+    if "douyin.com" in url:
+        try:
+            r = requests.get(url, headers=headers, allow_redirects=True, timeout=10)
+            item_ids = re.findall(r'/video/(\d+)', r.url) or re.findall(r'item_ids=(\d+)', r.url)
+            if item_ids:
+                api_url = f"https://www.iesdouyin.com/web/api/v2/aweme/iteminfo/?item_ids={item_ids[0]}"
+                res = requests.get(api_url, headers=headers, timeout=10).json()
+                video_url = res["item_list"][0]["video"]["play_addr"]["url_list"][0].replace("playwm", "play")
+                vr = requests.get(video_url, headers=headers, stream=True, timeout=20)
                 with open(output_path, 'wb') as f:
-                    for chunk in v_res.iter_content(chunk_size=1024*1024):
+                    for chunk in vr.iter_content(chunk_size=1024*1024):
                         if chunk: f.write(chunk)
                 if os.path.exists(output_path) and os.path.getsize(output_path) > 1024:
                     return output_path
+        except Exception:
+            pass
 
-    # Fallback to yt-dlp with mobile headers
     ydl_opts = {
-        'format': 'best',
+        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
         'outtmpl': output_path,
         'quiet': True,
         'no_warnings': True,
@@ -78,21 +75,10 @@ def download_douyin_video(url, output_path):
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         ydl.download([url])
-    return output_path if os.path.exists(output_path) else None
-
-def download_generic_video(url, output_path):
-    if "douyin.com" in url:
-        return download_douyin_video(url, output_path)
-    ydl_opts = {
-        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
-        'outtmpl': output_path,
-        'quiet': True,
-        'no_warnings': True,
-        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-    }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([url])
-    return output_path if os.path.exists(output_path) else None
+    
+    if not os.path.exists(output_path):
+        raise Exception("Video download မရရှိပါ")
+    return output_path
 
 def get_video_duration(video_path):
     cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", video_path]
@@ -101,32 +87,46 @@ def get_video_duration(video_path):
 
 def extract_audio(video_path, audio_path):
     subprocess.run(["ffmpeg", "-y", "-i", video_path, "-vn", "-acodec", "libmp3lame", "-q:a", "4", audio_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return os.path.exists(audio_path)
+    if not os.path.exists(audio_path):
+        raise Exception("Audio extraction failed")
+    return True
 
-def upload_to_gemini(path, mime_type="audio/mp3"):
+def analyze_with_gemini(audio_path):
     url = f"https://generativelanguage.googleapis.com/upload/v1beta/files?key={GEMINI_API_KEY}"
-    size = os.path.getsize(path)
-    h = {"X-Goog-Upload-Protocol": "resumable", "X-Goog-Upload-Command": "start", "X-Goog-Upload-Header-Content-Length": str(size), "X-Goog-Upload-Header-Content-Type": mime_type, "Content-Type": "application/json"}
-    init = requests.post(url, headers=h, json={"file": {"display_name": os.path.basename(path)}}, timeout=30)
-    upload_url = init.headers.get("X-Goog-Upload-URL")
-    with open(path, "rb") as f:
-        resp = requests.put(upload_url, headers={"Content-Length": str(size), "X-Goog-Upload-Offset": "0", "X-Goog-Upload-Command": "upload, finalize"}, data=f, timeout=120)
-    return resp.json()["file"]["uri"]
-
-def analyze_and_translate(audio_uri):
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+    size = os.path.getsize(audio_path)
+    headers = {
+        "X-Goog-Upload-Protocol": "resumable",
+        "X-Goog-Upload-Command": "start",
+        "X-Goog-Upload-Header-Content-Length": str(size),
+        "X-Goog-Upload-Header-Content-Type": "audio/mp3",
+        "Content-Type": "application/json"
+    }
+    init_res = requests.post(url, headers=headers, json={"file": {"display_name": os.path.basename(audio_path)}}, timeout=30)
+    upload_url = init_res.headers.get("X-Goog-Upload-URL")
+    
+    with open(audio_path, "rb") as f:
+        upload_res = requests.put(upload_url, headers={"Content-Length": str(size), "X-Goog-Upload-Offset": "0", "X-Goog-Upload-Command": "upload, finalize"}, data=f, timeout=120)
+    
+    file_info = upload_res.json()
+    file_uri = file_info.get("file", {}).get("uri")
+    
+    if not file_uri:
+        raise Exception("Gemini Audio upload failed")
+        
+    gen_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
     prompt = (
-        "Listen to the audio, transcribe dialogue and translate into natural spoken Burmese. "
-        "Return strictly a JSON array of objects with keys: 'start' (float seconds), 'end' (float seconds), 'text' (Burmese text). "
-        "Remove all Chinese characters."
+        "Transcribe and translate dialogue into natural spoken Burmese. "
+        "Return STRICT JSON array with keys: 'start' (float seconds), 'end' (float seconds), 'text' (Burmese text). "
+        "Remove all Chinese/English letters."
     )
     payload = {
-        "contents": [{"parts": [{"text": prompt}, {"file_data": {"mime_type": "audio/mp3", "file_uri": audio_uri}}]}],
+        "contents": [{"parts": [{"text": prompt}, {"file_data": {"mime_type": "audio/mp3", "file_uri": file_uri}}]}],
         "generationConfig": {"response_mime_type": "application/json"}
     }
-    resp = requests.post(url, json=payload, timeout=120)
-    txt = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
-    return json.loads(re.sub(r'```json\s*|\s*```', '', txt.strip()))
+    resp = requests.post(gen_url, json=payload, timeout=120)
+    data = resp.json()
+    raw_json = data["candidates"][0]["content"]["parts"][0]["text"]
+    return json.loads(re.sub(r'```json\s*|\s*```', '', raw_json.strip()))
 
 async def generate_speech(text, out_file):
     tts = edge_tts.Communicate(clean_non_burmese(text), "my-MM-ThihaNeural")
@@ -144,7 +144,7 @@ async def build_burmese_track(subs, total_dur, prefix):
             filter_complex.append(f"[{valid}]adelay={delay_ms}|{delay_ms}[a{valid}];")
             valid += 1
     if valid == 0:
-        raise Exception("ဘာသာပြန်အသံ ဖန်တီး၍မရပါ")
+        raise Exception("အသံဖိုင် ဖန်တီး၍မရပါ")
     mix_src = "".join([f"[a{k}]" for k in range(valid)])
     filter_complex.append(f"{mix_src}amix=inputs={valid}:dropout_transition=0:normalize=0[out]")
     out_audio = f"{prefix}_burmese.mp3"
@@ -169,17 +169,14 @@ async def process_video_pipeline(update: Update, context: ContextTypes.DEFAULT_T
     final_video = f"{prefix}_final.mp4"
 
     try:
-        if not download_generic_video(video_url, raw_video):
-            raise Exception("ဗီဒီယို ဒေါင်းလုဒ်မရရှိပါ (Link စစ်ဆေးပါ)")
-            
+        download_video_all(video_url, raw_video)
         dur = get_video_duration(raw_video)
         await msg.edit_text(build_ui(1, 30), parse_mode="HTML")
         
         extract_audio(raw_video, audio_file)
         await msg.edit_text(build_ui(2, 50), parse_mode="HTML")
         
-        uri = upload_to_gemini(audio_file)
-        subs = analyze_and_translate(uri)
+        subs = analyze_with_gemini(audio_file)
         await msg.edit_text(build_ui(3, 70), parse_mode="HTML")
         
         bm_audio = await build_burmese_track(subs, dur, prefix)
@@ -188,7 +185,7 @@ async def process_video_pipeline(update: Update, context: ContextTypes.DEFAULT_T
         merge_audio_video(raw_video, bm_audio, final_video)
         
         with open(final_video, "rb") as f:
-            await context.bot.send_video(chat_id=chat_id, video=f, caption="✅ မြန်မာအသံထည့်သွင်းပြီးပါပြီ။")
+            await context.bot.send_video(chat_id=chat_id, video=f, caption="✅ မြန်မာအသံ ထည့်သွင်းပြီးပါပြီ။")
         await msg.delete()
     except Exception as e:
         await msg.edit_text(build_ui(0, 0, error=str(e)[:150]), parse_mode="HTML")
@@ -199,7 +196,7 @@ async def process_video_pipeline(update: Update, context: ContextTypes.DEFAULT_T
                 except: pass
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("မင်္ဂလာပါ! Douyin / TikTok / YouTube Link ပို့ပေးပါ။")
+    await update.message.reply_text("မင်္ဂလာပါ! TikTok / Douyin / YouTube Link ပို့ပေးပါ။")
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     links = re.findall(r'https?://[^\s]+', update.message.text)
