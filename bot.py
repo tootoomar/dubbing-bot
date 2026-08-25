@@ -77,7 +77,7 @@ def create_progress_bar(percent: int) -> str:
 def build_status_ui_html(step: int, percent: int, error_text: str = None) -> str:
     steps_info = [
         ("Video Downloaded", 20),
-        ("Extracting Audio Context (Gemini Vertex Processing)", 35),
+        ("Extracting Audio Context (Gemini API Processing)", 35),
         ("Complete Video Dialogue Translation", 55),
         ("1.30x Speech Generation & Precision Stretch Sync", 75),
         ("Final High-Quality Multiplexing", 95),
@@ -533,56 +533,43 @@ def get_media_duration(file_path: str) -> float:
         return 60.0
 
 def _gemini_auth_headers() -> dict:
-    """AQ.* keys are used with Vertex AI Express Mode, not the old Gemini API endpoint."""
-    return {
-        "x-goog-api-key": GEMINI_API_KEY.strip(),
-        "Content-Type": "application/json",
-    }
+    """Use the Gemini API directly with the AQ.* authorization key."""
+    key = GEMINI_API_KEY.strip()
+    if not key:
+        raise Exception("GEMINI_API_KEY မသတ်မှတ်ရသေးပါ")
+    return {"x-goog-api-key": key, "Content-Type": "application/json"}
 
 
-def _vertex_generate_audio_json(audio_path: str, chunk_offset: float, chunk_duration: float):
-    """Send one compressed audio chunk directly to Vertex AI Express Mode."""
+def _gemini_generate_audio_json(audio_path: str, chunk_offset: float, chunk_duration: float):
+    """Send a small audio chunk to Gemini API as inline audio data."""
     if not os.path.exists(audio_path) or os.path.getsize(audio_path) == 0:
         raise Exception("Audio chunk မတွေ့ပါ")
 
-    # Keep each request comfortably small. The audio is speech-oriented mono MP3.
     with open(audio_path, "rb") as f:
         audio_b64 = base64.b64encode(f.read()).decode("ascii")
 
     prompt = f"""
 You are an expert movie subtitle and dubbing transcription AI.
-This is ONE audio chunk from a longer video.
-The chunk starts at global video time {chunk_offset:.3f} seconds and lasts about {chunk_duration:.3f} seconds.
+This is ONE audio chunk from a longer video. The chunk starts at global time {chunk_offset:.3f}s and lasts about {chunk_duration:.3f}s.
 
 TASK:
 1. Listen to the entire audio chunk carefully.
-2. Detect EVERY spoken sentence/dialogue in this chunk.
-3. Translate every spoken sentence into natural, conversational Burmese.
-4. Return timestamps RELATIVE TO THIS CHUNK, not global timestamps.
-5. If a sentence is cut at the beginning/end of the chunk, still include the audible portion.
-6. Do not invent dialogue during silence or music.
-7. Burmese text only. Keep names/English terms only when they are genuinely spoken names or unavoidable proper nouns.
+2. Detect EVERY spoken sentence/dialogue.
+3. Translate every spoken sentence into natural conversational Burmese.
+4. Return timestamps RELATIVE TO THIS CHUNK.
+5. Do not invent dialogue during silence or music.
+6. Burmese text only, except genuine proper names when necessary.
 
-OUTPUT ONLY valid JSON array. No markdown, no explanation:
-[
-  {{"start": 0.00, "end": 3.50, "burmese_text": "မြန်မာဘာသာပြန်စာကြောင်း"}}
-]
+OUTPUT ONLY valid JSON array:
+[{{"start":0.00,"end":3.50,"burmese_text":"မြန်မာဘာသာပြန်စာကြောင်း"}}]
 """
-
-    models = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
-    endpoint_base = "https://aiplatform.googleapis.com/v1/publishers/google/models"
 
     payload = {
         "contents": [{
             "role": "user",
             "parts": [
-                {
-                    "inlineData": {
-                        "mimeType": "audio/mpeg",
-                        "data": audio_b64,
-                    }
-                },
                 {"text": prompt},
+                {"inlineData": {"mimeType": "audio/mp3", "data": audio_b64}},
             ],
         }],
         "generationConfig": {
@@ -591,36 +578,36 @@ OUTPUT ONLY valid JSON array. No markdown, no explanation:
         },
     }
 
+    models = ["gemini-3.7-flash", "gemini-3.6-flash", "gemini-2.5-flash"]
+    base = "https://generativelanguage.googleapis.com/v1beta/models"
     last_error = ""
+
     for model_name in models:
         try:
-            url = f"{endpoint_base}/{model_name}:generateContent"
             res = requests.post(
-                url,
+                f"{base}/{model_name}:generateContent",
                 headers=_gemini_auth_headers(),
                 json=payload,
                 timeout=300,
             )
-
             if res.status_code >= 400:
-                last_error = f"HTTP {res.status_code}: {res.text[:800]}"
+                last_error = f"HTTP {res.status_code}: {res.text[:1200]}"
+                if res.status_code in (401, 403):
+                    break
                 continue
 
             data = res.json()
             candidates = data.get("candidates") or []
             if not candidates:
-                last_error = f"Gemini response မှာ candidates မရှိပါ: {data}"
+                last_error = f"Gemini response မှာ candidates မရှိပါ: {str(data)[:1000]}"
                 continue
-
             parts = candidates[0].get("content", {}).get("parts", [])
-            raw_text = "".join(
-                p.get("text", "") for p in parts if isinstance(p, dict)
-            ).strip()
+            raw_text = "".join(p.get("text", "") for p in parts if isinstance(p, dict)).strip()
             if not raw_text:
                 last_error = "Gemini က text response မပြန်ပါ"
                 continue
 
-            raw_text = re.sub(r"^```json\s*|\s*```$", "", raw_text, flags=re.I).strip()
+            raw_text = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw_text, flags=re.I).strip()
             parsed = json.loads(raw_text)
             if not isinstance(parsed, list):
                 raise ValueError("Gemini JSON array မဟုတ်ပါ")
@@ -634,45 +621,27 @@ OUTPUT ONLY valid JSON array. No markdown, no explanation:
                     en = max(st + 0.05, float(item.get("end", st + 0.5)))
                 except Exception:
                     continue
-
                 st = min(st, chunk_duration)
-                en = min(en, chunk_duration)
+                en = min(max(st + 0.05, en), chunk_duration)
                 text = clean_pure_burmese_speech(item.get("burmese_text", ""))
                 if text and en > st:
-                    result.append({
-                        "start": chunk_offset + st,
-                        "end": chunk_offset + en,
-                        "burmese_text": text,
-                    })
-
+                    result.append({"start": chunk_offset + st, "end": chunk_offset + en, "burmese_text": text})
             if result:
                 return result
             last_error = "Gemini က အသံစာသား segment မပြန်ပါ"
-
         except Exception as e:
             last_error = str(e)
 
-    raise Exception(f"Gemini Vertex Audio Processing Error: {last_error}")
+    raise Exception(f"Gemini API Audio Processing Error: {last_error}")
 
 
 def extract_timestamped_dubbing_json(audio_path: str, total_duration: float):
-    """
-    AQ.* Gemini keys are Authorization/Vertex Express keys.  Therefore we do
-    NOT call generativelanguage.googleapis.com or the Gemini Files API here.
-    Instead, split the compressed speech audio into small chunks and send each
-    chunk as inlineData to Vertex AI Express Mode.
-    """
+    """Use Gemini API, not Vertex AI, for AQ.* authorization keys."""
     if not GEMINI_API_KEY or not GEMINI_API_KEY.strip():
         raise Exception("GEMINI_API_KEY မသတ်မှတ်ရသေးပါ")
 
-    if not GEMINI_API_KEY.strip().startswith("AQ."):
-        raise Exception(
-            "ဒီ Version က AQ.* Vertex AI Express key အတွက် ပြင်ထားတာပါ။ "
-            "AI Studio AIza key သုံးမယ်ဆိုရင် Gemini API Version ကို သုံးပါ။"
-        )
-
     total_duration = max(0.1, float(total_duration))
-    chunk_seconds = 480.0  # 8 minutes per request
+    chunk_seconds = 480.0
     overlap = 1.5
     all_segments = []
     chunk_files = []
@@ -687,32 +656,16 @@ def extract_timestamped_dubbing_json(audio_path: str, total_duration: float):
             chunk_path = f"gemini_chunk_{os.getpid()}_{chunk_index}.mp3"
             chunk_files.append(chunk_path)
 
-            subprocess.run(
-                [
-                    "ffmpeg", "-y",
-                    "-ss", f"{chunk_start:.3f}",
-                    "-t", f"{chunk_duration:.3f}",
-                    "-i", audio_path,
-                    "-ac", "1",
-                    "-ar", "16000",
-                    "-b:a", "24k",
-                    chunk_path,
-                ],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=True,
-            )
+            subprocess.run([
+                "ffmpeg", "-y", "-ss", f"{chunk_start:.3f}",
+                "-t", f"{chunk_duration:.3f}", "-i", audio_path,
+                "-ac", "1", "-ar", "16000", "-b:a", "24k", chunk_path,
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
 
-            chunk_segments = _vertex_generate_audio_json(
-                chunk_path,
-                chunk_start,
-                chunk_duration,
-            )
-            all_segments.extend(chunk_segments)
+            all_segments.extend(_gemini_generate_audio_json(chunk_path, chunk_start, chunk_duration))
             offset = chunk_end
             chunk_index += 1
 
-        # Sort, remove duplicates caused by the overlap, and clamp to video duration.
         all_segments.sort(key=lambda x: (float(x["start"]), float(x["end"])))
         deduped = []
         for seg in all_segments:
@@ -722,19 +675,12 @@ def extract_timestamped_dubbing_json(audio_path: str, total_duration: float):
             duplicate = False
             for prev in reversed(deduped[-5:]):
                 overlap_time = min(seg["end"], prev["end"]) - max(seg["start"], prev["start"])
-                if overlap_time > 0 and text == prev["burmese_text"]:
-                    duplicate = True
-                    break
-                if abs(seg["start"] - prev["start"]) < 1.2 and text == prev["burmese_text"]:
+                if (overlap_time > 0 or abs(seg["start"] - prev["start"]) < 1.2) and text == prev["burmese_text"]:
                     duplicate = True
                     break
             if not duplicate:
                 deduped.append(seg)
-
-        if not deduped:
-            raise Exception("Gemini က dialogue မတွေ့ရှိပါ")
         return deduped
-
     finally:
         for f in chunk_files:
             if os.path.exists(f):
